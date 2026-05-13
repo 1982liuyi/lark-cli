@@ -5,6 +5,7 @@
 package events
 
 import (
+	"github.com/larksuite/cli/events/card"
 	"github.com/larksuite/cli/events/im"
 	"github.com/larksuite/cli/internal/event"
 )
@@ -13,6 +14,7 @@ import (
 func init() {
 	all := [][]event.KeyDefinition{
 		im.Keys(),
+		card.Keys(),
 	}
 	for _, keys := range all {
 		for _, k := range keys {
