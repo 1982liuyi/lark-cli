@@ -6,10 +6,7 @@ package event
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"os"
 
-	"github.com/larksuite/cli/internal/output"
 	convertlib "github.com/larksuite/cli/shortcuts/im/convert_lib"
 )
 
@@ -49,12 +46,8 @@ func (p *ImMessageProcessor) Transform(_ context.Context, raw *RawEvent, mode Tr
 		return raw
 	}
 
-	// Card messages (interactive) are not yet supported for compact conversion;
-	// return raw event data directly.
-	if ev.Message.MessageType == "interactive" {
-		fmt.Fprintf(os.Stderr, "%s[hint]%s card message (interactive) compact conversion is not yet supported, returning raw event data\n", output.Dim, output.Reset)
-		return raw
-	}
+	// Card messages (interactive) are now supported for compact conversion
+	// via interactiveConverter in convertlib.
 
 	// Use convertlib to convert raw content JSON into human-readable text.
 	// Resolves @mention keys (e.g. @_user_1) to display names.
@@ -62,6 +55,13 @@ func (p *ImMessageProcessor) Transform(_ context.Context, raw *RawEvent, mode Tr
 		RawContent: ev.Message.Content,
 		MentionMap: convertlib.BuildMentionKeyMap(ev.Message.Mentions),
 	})
+
+	// Fallback: if conversion returns empty/placeholder, use raw content
+	if content == "" || content == "[interactive card]" {
+		if ev.Message.MessageType == "interactive" && ev.Message.Content != "" {
+			content = ev.Message.Content
+		}
+	}
 
 	// Build compact output with core message metadata
 	out := map[string]interface{}{
@@ -91,6 +91,10 @@ func (p *ImMessageProcessor) Transform(_ context.Context, raw *RawEvent, mode Tr
 	}
 	if ev.Sender.SenderID.OpenID != "" {
 		out["sender_id"] = ev.Sender.SenderID.OpenID
+	}
+	// Always include mentions array for group message filtering
+	if len(ev.Message.Mentions) > 0 {
+		out["mentions"] = ev.Message.Mentions
 	}
 	if content != "" {
 		out["content"] = content
