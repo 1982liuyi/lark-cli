@@ -70,6 +70,32 @@ func TestSuggestDomain_ExactMatch(t *testing.T) {
 	}
 }
 
+func TestNormalizeScopeInput(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"single", "vc:note:read", "vc:note:read"},
+		{"comma", "vc:note:read,vc:meeting.meetingevent:read", "vc:note:read vc:meeting.meetingevent:read"},
+		{"space", "vc:note:read vc:meeting.meetingevent:read", "vc:note:read vc:meeting.meetingevent:read"},
+		{"comma_and_spaces", "vc:note:read, vc:meeting.meetingevent:read", "vc:note:read vc:meeting.meetingevent:read"},
+		{"mixed_separators", "a, b\tc\nd  e", "a b c d e"},
+		{"trim_and_dedup", "  a , b , a  ", "a b"},
+		{"trailing_separators", "a,b,,", "a b"},
+		{"only_separators", " , , ", ""},
+		{"tab_separated", "im:message:send\toffline_access", "im:message:send offline_access"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeScopeInput(tc.in); got != tc.want {
+				t.Errorf("normalizeScopeInput(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestShortcutSupportsIdentity_DefaultUser(t *testing.T) {
 	// Empty AuthTypes defaults to ["user"]
 	sc := common.Shortcut{AuthTypes: nil}
@@ -145,7 +171,7 @@ func TestCompleteDomain_CommaSeparated(t *testing.T) {
 }
 
 func TestAllKnownDomains(t *testing.T) {
-	domains := allKnownDomains()
+	domains := allKnownDomains("")
 	if len(domains) == 0 {
 		t.Fatal("expected non-empty known domains")
 	}
@@ -159,7 +185,7 @@ func TestAllKnownDomains(t *testing.T) {
 }
 
 func TestSortedKnownDomains(t *testing.T) {
-	sorted := sortedKnownDomains()
+	sorted := sortedKnownDomains("")
 	if len(sorted) == 0 {
 		t.Fatal("expected non-empty sorted domains")
 	}
@@ -169,7 +195,7 @@ func TestSortedKnownDomains(t *testing.T) {
 	}
 
 	// Should match allKnownDomains
-	known := allKnownDomains()
+	known := allKnownDomains("")
 	if len(sorted) != len(known) {
 		t.Errorf("sorted (%d) and known (%d) length mismatch", len(sorted), len(known))
 	}
@@ -194,7 +220,7 @@ func TestCollectScopesForDomains(t *testing.T) {
 		t.Skip("no from_meta data available")
 	}
 
-	scopes := collectScopesForDomains([]string{"calendar"}, "user")
+	scopes := collectScopesForDomains([]string{"calendar"}, "user", "")
 	if len(scopes) == 0 {
 		t.Fatal("expected non-empty scopes for calendar domain")
 	}
@@ -221,7 +247,7 @@ func TestCollectScopesForDomains(t *testing.T) {
 }
 
 func TestCollectScopesForDomains_NonexistentDomain(t *testing.T) {
-	scopes := collectScopesForDomains([]string{"nonexistent_domain_xyz"}, "user")
+	scopes := collectScopesForDomains([]string{"nonexistent_domain_xyz"}, "user", "")
 	if len(scopes) != 0 {
 		t.Errorf("expected empty scopes for nonexistent domain, got %d", len(scopes))
 	}
@@ -289,10 +315,12 @@ func TestAuthLoginRun_NonTerminal_NoFlags_RejectsWithHint(t *testing.T) {
 	if !strings.Contains(msg, "scopes") {
 		t.Errorf("expected error to mention scopes, got: %s", msg)
 	}
-	// Stderr should contain background hint
+	// Stderr should explain the split-flow path for non-streaming agents.
 	stderrStr := stderr.String()
-	if !strings.Contains(stderrStr, "background") {
-		t.Errorf("expected stderr to mention background, got: %s", stderrStr)
+	for _, want := range []string{"--no-wait --json", "final message of the turn", "--device-code"} {
+		if !strings.Contains(stderrStr, want) {
+			t.Errorf("expected stderr to mention %q, got: %s", want, stderrStr)
+		}
 	}
 }
 
@@ -879,6 +907,70 @@ func TestAuthLoginRun_JSONWriteFailure_NoWaitReturnsWriterError(t *testing.T) {
 	}
 }
 
+func TestAuthLoginRun_NoWaitJSONHintIncludesRawURLGuidance(t *testing.T) {
+	f, stdout, _, reg := cmdutil.TestFactory(t, &core.CliConfig{
+		ProfileName: "default",
+		AppID:       "cli_test",
+		AppSecret:   "secret",
+		Brand:       core.BrandFeishu,
+	})
+
+	reg.Register(&httpmock.Stub{
+		Method: "POST",
+		URL:    larkauth.PathDeviceAuthorization,
+		Body: map[string]interface{}{
+			"device_code":               "device-code",
+			"user_code":                 "user-code",
+			"verification_uri":          "https://example.com/verify",
+			"verification_uri_complete": "https://example.com/verify?code=123",
+			"expires_in":                240,
+			"interval":                  5,
+		},
+	})
+
+	err := authLoginRun(&LoginOptions{
+		Factory: f,
+		Ctx:     context.Background(),
+		Scope:   "im:message:send",
+		NoWait:  true,
+	})
+	if err != nil {
+		t.Fatalf("authLoginRun() error = %v", err)
+	}
+
+	dec := json.NewDecoder(strings.NewReader(stdout.String()))
+	var data map[string]interface{}
+	if err := dec.Decode(&data); err != nil {
+		t.Fatalf("Decode(stdout first event) error = %v, stdout=%q", err, stdout.String())
+	}
+	hint, _ := data["hint"].(string)
+	for _, want := range []string{
+		"exactly as returned by the CLI",
+		"opaque string",
+		"Do not URL-encode or decode it",
+		"do not add %20, spaces, or punctuation",
+		"do not wrap it as Markdown link text",
+		"fenced code block containing only the raw URL",
+		"final message of the turn",
+		"return control to the user",
+		"do not block on --device-code in the same turn",
+		"After the user confirms authorization in a later step",
+		"lark-cli auth login --device-code device-code",
+	} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("hint missing %q, got:\n%s", want, hint)
+		}
+	}
+	for _, unwanted := range []string{
+		"Then immediately execute",
+		"Do not instruct the user to run this command themselves",
+	} {
+		if strings.Contains(hint, unwanted) {
+			t.Fatalf("hint should not contain %q, got:\n%s", unwanted, hint)
+		}
+	}
+}
+
 func TestAuthLoginRun_JSONWriteFailure_DeviceAuthorizationReturnsWriterError(t *testing.T) {
 	f, _, _, reg := cmdutil.TestFactory(t, &core.CliConfig{
 		ProfileName: "default",
@@ -917,6 +1009,64 @@ func TestAuthLoginRun_JSONWriteFailure_DeviceAuthorizationReturnsWriterError(t *
 	}
 }
 
+func TestAuthLoginRun_JSONDeviceAuthorizationAgentHintIncludesRawURLGuidance(t *testing.T) {
+	f, stdout, _, reg := cmdutil.TestFactory(t, &core.CliConfig{
+		ProfileName: "default",
+		AppID:       "cli_test",
+		AppSecret:   "secret",
+		Brand:       core.BrandFeishu,
+	})
+
+	reg.Register(&httpmock.Stub{
+		Method: "POST",
+		URL:    larkauth.PathDeviceAuthorization,
+		Body: map[string]interface{}{
+			"device_code":               "device-code",
+			"user_code":                 "user-code",
+			"verification_uri":          "https://example.com/verify",
+			"verification_uri_complete": "https://example.com/verify?code=123",
+			"expires_in":                240,
+			"interval":                  5,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := authLoginRun(&LoginOptions{
+		Factory: f,
+		Ctx:     ctx,
+		Scope:   "im:message:send",
+		JSON:    true,
+	})
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+
+	dec := json.NewDecoder(strings.NewReader(stdout.String()))
+	var data map[string]interface{}
+	if err := dec.Decode(&data); err != nil {
+		t.Fatalf("Decode(stdout first event) error = %v, stdout=%q", err, stdout.String())
+	}
+	hint, _ := data["agent_hint"].(string)
+	for _, want := range []string{
+		"timeout >= 600s",
+		"本轮最终消息",
+		"结束本轮",
+		"用户回复已完成授权",
+		"不要在同一轮里展示 URL 后立刻阻塞执行 --device-code",
+		"逐字原样转发 CLI 返回的 URL",
+		"opaque string",
+		"不要做 URL 编码或解码",
+		"不要补 `%20`、空格或标点",
+		"不要改写成 Markdown 链接",
+		"只包含该 URL 的代码块单独输出",
+	} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("agent_hint missing %q, got:\n%s", want, hint)
+		}
+	}
+}
+
 func TestGetDomainMetadata_ExcludesEvent(t *testing.T) {
 	domains := getDomainMetadata("zh")
 	for _, dm := range domains {
@@ -927,7 +1077,7 @@ func TestGetDomainMetadata_ExcludesEvent(t *testing.T) {
 }
 
 func TestAllKnownDomains_ExcludesAuthDomainChildren(t *testing.T) {
-	domains := allKnownDomains()
+	domains := allKnownDomains("")
 	if domains["whiteboard"] {
 		t.Error("whiteboard should not appear in known auth domains (it has auth_domain=docs)")
 	}
@@ -937,7 +1087,7 @@ func TestAllKnownDomains_ExcludesAuthDomainChildren(t *testing.T) {
 }
 
 func TestCollectScopesForDomains_ExpandsAuthDomainChildren(t *testing.T) {
-	scopes := collectScopesForDomains([]string{"docs"}, "user")
+	scopes := collectScopesForDomains([]string{"docs"}, "user", "")
 	// docs domain should include whiteboard shortcut scopes (board:whiteboard:*)
 	found := false
 	for _, s := range scopes {

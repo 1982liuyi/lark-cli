@@ -15,6 +15,10 @@ func TestShortcutsIncludesExpectedCommands(t *testing.T) {
 		"+create-folder",
 		"+create-shortcut",
 		"+download",
+		"+version-history",
+		"+version-get",
+		"+version-revert",
+		"+version-delete",
 		"+add-comment",
 		"+export",
 		"+export-download",
@@ -24,9 +28,11 @@ func TestShortcutsIncludesExpectedCommands(t *testing.T) {
 		"+status",
 		"+push",
 		"+pull",
+		"+sync",
 		"+task_result",
 		"+apply-permission",
 		"+search",
+		"+inspect",
 	}
 
 	if len(got) != len(want) {

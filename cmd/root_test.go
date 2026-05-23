@@ -11,9 +11,12 @@ import (
 	"github.com/larksuite/cli/cmd/auth"
 	cmdconfig "github.com/larksuite/cli/cmd/config"
 	"github.com/larksuite/cli/cmd/schema"
+	internalauth "github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/internal/registry"
+	"github.com/spf13/cobra"
 )
 
 // TestPersistentPreRunE_AuthCheckDisabledAnnotations verifies that
@@ -188,6 +191,150 @@ func TestEnrichPermissionError_SpecialCharsEscaped(t *testing.T) {
 	}
 }
 
+func TestEnrichMissingScopeError_ServiceMethodUsesLocalScopesWhenNoUAT(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "test-app", AppSecret: "test-secret", Brand: core.BrandFeishu,
+	})
+	f.ResolvedIdentity = core.AsUser
+
+	var target registry.CommandEntry
+	for _, entry := range registry.CollectCommandScopes([]string{"calendar"}, "user") {
+		if len(entry.Scopes) == 1 && entry.Scopes[0] == "calendar:calendar.event:create" {
+			target = entry
+			break
+		}
+	}
+	if target.Command == "" {
+		t.Fatal("failed to locate a calendar create command in local registry metadata")
+	}
+	parts := strings.Split(target.Command, " ")
+	if len(parts) != 2 {
+		t.Fatalf("expected resource/method command, got %q", target.Command)
+	}
+
+	root := &cobra.Command{Use: "lark-cli"}
+	serviceCmd := &cobra.Command{Use: "calendar"}
+	resourceCmd := &cobra.Command{Use: parts[0]}
+	methodCmd := &cobra.Command{Use: parts[1]}
+	root.AddCommand(serviceCmd)
+	serviceCmd.AddCommand(resourceCmd)
+	resourceCmd.AddCommand(methodCmd)
+	f.CurrentCommand = methodCmd
+
+	exitErr := output.Errorf(output.ExitAPI, "api_error", "API call failed: %s", &internalauth.NeedAuthorizationError{})
+	enrichMissingScopeError(f, exitErr)
+
+	if exitErr.Code != output.ExitAPI {
+		t.Fatalf("expected exit code %d, got %d", output.ExitAPI, exitErr.Code)
+	}
+	if exitErr.Detail == nil || exitErr.Detail.Type != "api_error" {
+		t.Fatalf("expected api_error detail, got %+v", exitErr.Detail)
+	}
+	if !strings.Contains(exitErr.Detail.Message, "need_user_authorization") {
+		t.Fatalf("expected original need_user_authorization message, got %q", exitErr.Detail.Message)
+	}
+	if !strings.Contains(exitErr.Detail.Hint, "current command requires scope(s): calendar:calendar.event:create") {
+		t.Fatalf("expected scope guidance in hint, got %q", exitErr.Detail.Hint)
+	}
+	if strings.Contains(exitErr.Detail.Hint, "lark-cli auth login --scope") {
+		t.Fatalf("expected hint without auth login command, got %q", exitErr.Detail.Hint)
+	}
+	if exitErr.Detail.Detail != nil {
+		t.Fatalf("expected detail to remain nil, got %#v", exitErr.Detail.Detail)
+	}
+}
+
+func TestEnrichMissingScopeError_ShortcutUsesDeclaredScopesWhenNoUAT(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "test-app", AppSecret: "test-secret", Brand: core.BrandFeishu,
+	})
+	f.ResolvedIdentity = core.AsUser
+
+	root := &cobra.Command{Use: "lark-cli"}
+	serviceCmd := &cobra.Command{Use: "docs"}
+	shortcutCmd := &cobra.Command{Use: "+create"}
+	root.AddCommand(serviceCmd)
+	serviceCmd.AddCommand(shortcutCmd)
+	f.CurrentCommand = shortcutCmd
+
+	exitErr := output.ErrNetwork("API call failed: %s", &internalauth.NeedAuthorizationError{})
+	enrichMissingScopeError(f, exitErr)
+
+	if exitErr.Code != output.ExitNetwork {
+		t.Fatalf("expected exit code %d, got %d", output.ExitNetwork, exitErr.Code)
+	}
+	if exitErr.Detail == nil || exitErr.Detail.Type != "network" {
+		t.Fatalf("expected network detail, got %+v", exitErr.Detail)
+	}
+	if !strings.Contains(exitErr.Detail.Message, "need_user_authorization") {
+		t.Fatalf("expected original need_user_authorization message, got %q", exitErr.Detail.Message)
+	}
+	if !strings.Contains(exitErr.Detail.Hint, "current command requires scope(s): docx:document:create") {
+		t.Fatalf("expected shortcut scope hint, got %q", exitErr.Detail.Hint)
+	}
+	if strings.Contains(exitErr.Detail.Hint, "lark-cli auth login --scope") {
+		t.Fatalf("expected hint without auth login command, got %q", exitErr.Detail.Hint)
+	}
+	if exitErr.Detail.Detail != nil {
+		t.Fatalf("expected detail to remain nil, got %#v", exitErr.Detail.Detail)
+	}
+}
+
+func TestEnrichMissingScopeError_ShortcutIncludesConditionalScopes(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "test-app", AppSecret: "test-secret", Brand: core.BrandFeishu,
+	})
+	f.ResolvedIdentity = core.AsUser
+
+	root := &cobra.Command{Use: "lark-cli"}
+	serviceCmd := &cobra.Command{Use: "drive"}
+	shortcutCmd := &cobra.Command{Use: "+status"}
+	root.AddCommand(serviceCmd)
+	serviceCmd.AddCommand(shortcutCmd)
+	f.CurrentCommand = shortcutCmd
+
+	exitErr := output.ErrNetwork("API call failed: %s", &internalauth.NeedAuthorizationError{})
+	enrichMissingScopeError(f, exitErr)
+
+	if exitErr.Detail == nil {
+		t.Fatal("expected error detail")
+	}
+	if !strings.Contains(exitErr.Detail.Hint, "current command requires scope(s): drive:drive.metadata:readonly, drive:file:download") {
+		t.Fatalf("expected conditional scope hint for drive +status, got %q", exitErr.Detail.Hint)
+	}
+}
+
+func TestEnrichMissingScopeError_AppendsExistingHint(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "test-app", AppSecret: "test-secret", Brand: core.BrandFeishu,
+	})
+	f.ResolvedIdentity = core.AsUser
+
+	root := &cobra.Command{Use: "lark-cli"}
+	serviceCmd := &cobra.Command{Use: "docs"}
+	shortcutCmd := &cobra.Command{Use: "+create"}
+	root.AddCommand(serviceCmd)
+	serviceCmd.AddCommand(shortcutCmd)
+	f.CurrentCommand = shortcutCmd
+
+	exitErr := output.ErrNetwork("API call failed: %s", &internalauth.NeedAuthorizationError{})
+	exitErr.Detail.Hint = "existing hint"
+	enrichMissingScopeError(f, exitErr)
+
+	want := "existing hint\ncurrent command requires scope(s): docx:document:create"
+	if exitErr.Detail.Hint != want {
+		t.Fatalf("expected appended hint %q, got %q", want, exitErr.Detail.Hint)
+	}
+}
+
 func TestRootLong_AgentSkillsLinkTargetsReadmeSection(t *testing.T) {
 	if !strings.Contains(rootLong, "https://github.com/larksuite/cli#agent-skills") {
 		t.Fatalf("root help should link to the README Agent Skills section, got:\n%s", rootLong)
@@ -209,6 +356,7 @@ func TestConfigureFlagCompletions(t *testing.T) {
 		{"help flag", []string{"im", "--help"}, true},
 		{"no args", []string{}, true},
 		{"__complete request", []string{"__complete", "im", "+send", ""}, false},
+		{"__completeNoDesc request", []string{"__completeNoDesc", "im", "+send", ""}, false},
 		{"completion subcommand", []string{"completion", "bash"}, false},
 	}
 	for _, tc := range tests {
@@ -217,6 +365,33 @@ func TestConfigureFlagCompletions(t *testing.T) {
 			configureFlagCompletions(tc.args)
 			if got := !cmdutil.FlagCompletionsEnabled(); got != tc.wantDisabled {
 				t.Fatalf("FlagCompletionsEnabled() = %v, want disabled=%v", !got, tc.wantDisabled)
+			}
+		})
+	}
+}
+
+// isCompletionCommand must classify BOTH cobra completion aliases as
+// completion requests so the Shutdown emit and update-notice paths skip
+// shell-completion invocations. __completeNoDesc is an Alias of
+// __complete (cobra/completions.go ShellCompNoDescRequestCmd) and
+// dispatches the same RunE; bash/zsh completion typically calls the
+// NoDesc variant.
+func TestIsCompletionCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"plain command", []string{"im", "+send"}, false},
+		{"__complete", []string{"__complete", "im"}, true},
+		{"__completeNoDesc", []string{"__completeNoDesc", "im"}, true},
+		{"completion subcommand", []string{"completion", "bash"}, true},
+		{"completion in tail", []string{"foo", "bar", "completion"}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCompletionCommand(tc.args); got != tc.want {
+				t.Fatalf("isCompletionCommand(%v) = %v, want %v", tc.args, got, tc.want)
 			}
 		})
 	}

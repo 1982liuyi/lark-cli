@@ -39,6 +39,7 @@ type Factory struct {
 	Keychain             keychain.KeychainAccess // secret storage (real keychain in prod, mock in tests)
 	IdentityAutoDetected bool                    // set by ResolveAs when identity was auto-detected
 	ResolvedIdentity     core.Identity           // identity resolved by the last ResolveAs call
+	CurrentCommand       *cobra.Command          // last matched command being executed; set during PersistentPreRun
 
 	Credential *credential.CredentialProvider
 
@@ -160,7 +161,7 @@ func (f *Factory) ResolveStrictMode(ctx context.Context) core.StrictMode {
 func (f *Factory) CheckStrictMode(ctx context.Context, as core.Identity) error {
 	mode := f.ResolveStrictMode(ctx)
 	if mode.IsActive() && !mode.AllowsIdentity(as) {
-		return output.ErrWithHint(output.ExitValidation, "strict_mode",
+		return output.ErrWithHint(output.ExitValidation, "command_denied",
 			fmt.Sprintf("strict mode is %q, only %s-identity commands are available", mode, mode.ForcedIdentity()),
 			"if the user explicitly wants to switch policy, see `lark-cli config strict-mode --help` (confirm with the user before switching; switching does NOT require re-bind)")
 	}

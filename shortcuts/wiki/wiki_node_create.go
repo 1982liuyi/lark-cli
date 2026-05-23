@@ -118,6 +118,7 @@ type wikiNodeRecord struct {
 	OriginNodeToken string
 	Title           string
 	HasChild        bool
+	URL             string
 }
 
 // wikiSpaceRecord contains the response fields used when resolving spaces.
@@ -413,6 +414,25 @@ func requireWikiSpaceID(space *wikiSpaceRecord) (string, error) {
 	return "", output.ErrValidation("personal document library was not found, please specify --space-id")
 }
 
+// resolveMyLibrarySpaceID calls GET /wiki/v2/spaces/my_library and returns
+// the per-user real space_id. Shared by shortcuts that accept the my_library
+// alias (e.g. +node-create, +node-list) so the behavior stays consistent.
+func resolveMyLibrarySpaceID(runtime *common.RuntimeContext) (string, error) {
+	data, err := runtime.CallAPI(
+		"GET",
+		fmt.Sprintf("/open-apis/wiki/v2/spaces/%s", validate.EncodePathSegment(wikiMyLibrarySpaceID)),
+		nil, nil,
+	)
+	if err != nil {
+		return "", err
+	}
+	space, err := parseWikiSpaceRecord(common.GetMap(data, "space"))
+	if err != nil {
+		return "", err
+	}
+	return requireWikiSpaceID(space)
+}
+
 func validateOptionalResourceName(value, flagName string) error {
 	if value == "" {
 		return nil
@@ -437,6 +457,7 @@ func parseWikiNodeRecord(node map[string]interface{}) (*wikiNodeRecord, error) {
 		OriginNodeToken: common.GetString(node, "origin_node_token"),
 		Title:           common.GetString(node, "title"),
 		HasChild:        common.GetBool(node, "has_child"),
+		URL:             common.GetString(node, "url"),
 	}, nil
 }
 
@@ -479,7 +500,7 @@ func augmentWikiNodeCreateOutput(runtime *common.RuntimeContext, execution *wiki
 	if grant := common.AutoGrantCurrentUserDrivePermission(runtime, execution.Node.NodeToken, "wiki"); grant != nil {
 		out["permission_grant"] = grant
 	}
-	if u := common.BuildResourceURL(runtime.Config.Brand, "wiki", execution.Node.NodeToken); u != "" {
+	if u := wikiNodeURL(runtime.Config.Brand, execution.Node); u != "" {
 		out["url"] = u
 	}
 	return out

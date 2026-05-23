@@ -30,6 +30,7 @@ type LoginOptions struct {
 	Scope      string
 	Recommend  bool
 	Domains    []string
+	Exclude    []string
 	NoWait     bool
 	DeviceCode string
 }
@@ -46,10 +47,12 @@ func NewCmdAuthLogin(f *cmdutil.Factory, runF func(*LoginOptions) error) *cobra.
 		Long: `Device Flow authorization login.
 
 For AI agents: this command blocks until the user completes authorization in the
-browser. Run it in the background and retrieve the verification URL from its output.`,
+browser. If your harness only delivers final turn messages, use --no-wait --json,
+send the verification URL to the user as your final message, end the turn, then
+run --device-code in a later step after the user confirms authorization.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if mode := f.ResolveStrictMode(cmd.Context()); mode == core.StrictModeBot {
-				return output.ErrWithHint(output.ExitValidation, "strict_mode",
+				return output.ErrWithHint(output.ExitValidation, "command_denied",
 					fmt.Sprintf("strict mode is %q, user login is disabled in this profile", mode),
 					"if the user explicitly wants to switch to user identity, see `lark-cli config strict-mode --help` (confirm with the user before switching; switching does NOT require re-bind)")
 			}
@@ -61,12 +64,21 @@ browser. Run it in the background and retrieve the verification URL from its out
 		},
 	}
 	cmdutil.SetSupportedIdentities(cmd, []string{"user"})
+	cmdutil.SetRisk(cmd, "write")
 
-	cmd.Flags().StringVar(&opts.Scope, "scope", "", "scopes to request (space-separated)")
+	cmd.Flags().StringVar(&opts.Scope, "scope", "", "scopes to request (space- or comma-separated). Combines additively with --domain/--recommend")
 	cmd.Flags().BoolVar(&opts.Recommend, "recommend", false, "request only recommended (auto-approve) scopes")
-	available := sortedKnownDomains()
+	var helpBrand core.LarkBrand
+	if f != nil && f.Config != nil {
+		if cfg, err := f.Config(); err == nil && cfg != nil {
+			helpBrand = cfg.Brand
+		}
+	}
+	available := sortedKnownDomains(helpBrand)
 	cmd.Flags().StringSliceVar(&opts.Domains, "domain", nil,
 		fmt.Sprintf("domain (repeatable or comma-separated, e.g. --domain calendar,task)\navailable: %s, all", strings.Join(available, ", ")))
+	cmd.Flags().StringSliceVar(&opts.Exclude, "exclude", nil,
+		"scopes to exclude from the request (repeatable or comma-separated, e.g. --exclude drive:file:download)")
 	cmd.Flags().BoolVar(&opts.JSON, "json", false, "structured JSON output")
 	cmd.Flags().BoolVar(&opts.NoWait, "no-wait", false, "initiate device authorization and return immediately; use --device-code to complete")
 	cmd.Flags().StringVar(&opts.DeviceCode, "device-code", "", "poll and complete authorization with a device code from a previous --no-wait call")
@@ -133,14 +145,14 @@ func authLoginRun(opts *LoginOptions) error {
 	// Expand --domain all to all available domains (from_meta projects + shortcut services)
 	for _, d := range selectedDomains {
 		if strings.EqualFold(d, "all") {
-			selectedDomains = sortedKnownDomains()
+			selectedDomains = sortedKnownDomains(config.Brand)
 			break
 		}
 	}
 
 	// Validate domain names and suggest corrections for unknown ones
 	if len(selectedDomains) > 0 {
-		knownDomains := allKnownDomains()
+		knownDomains := allKnownDomains(config.Brand)
 		for _, d := range selectedDomains {
 			if !knownDomains[d] {
 				if suggestion := suggestDomain(d, knownDomains); suggestion != "" {
@@ -158,9 +170,13 @@ func authLoginRun(opts *LoginOptions) error {
 
 	hasAnyOption := opts.Scope != "" || opts.Recommend || len(selectedDomains) > 0
 
+	if len(opts.Exclude) > 0 && !hasAnyOption {
+		return output.ErrValidation("--exclude requires --scope, --domain, or --recommend to be specified")
+	}
+
 	if !hasAnyOption {
 		if !opts.JSON && f.IOStreams.IsTerminal {
-			result, err := runInteractiveLogin(f.IOStreams, lang, msg)
+			result, err := runInteractiveLogin(f.IOStreams, lang, msg, config.Brand)
 			if err != nil {
 				return err
 			}
@@ -180,25 +196,28 @@ func authLoginRun(opts *LoginOptions) error {
 			log("View all options:")
 			log(msg.HintFooter)
 			log("")
-			log("Note: this command blocks until authorization is complete. Run it in the background and retrieve the verification URL from its output.")
+			log("Note: this command blocks until authorization is complete. For non-streaming agent harnesses, use --no-wait --json, send the verification URL as the final message of the turn, then run --device-code in a later step after the user confirms authorization.")
 			return output.ErrValidation("please specify the scopes to authorize")
 		}
 	}
 
-	finalScope := opts.Scope
+	// Normalize --scope so users can pass either OAuth-standard space-separated
+	// values or the more natural comma-separated list. RFC 6749 §3.3 mandates
+	// space-delimited scopes in the wire request, so the device authorization
+	// endpoint rejects raw "a,b" strings as a single malformed scope.
+	finalScope := normalizeScopeInput(opts.Scope)
 
-	// Resolve scopes from domain/permission filters
+	// Resolve scopes from domain/permission filters and merge with --scope.
+	// --scope, --domain, and --recommend combine additively so callers can,
+	// for example, request all `docs` scopes plus a few specific `drive`
+	// scopes in a single command.
 	if len(selectedDomains) > 0 || opts.Recommend {
-		if opts.Scope != "" {
-			return output.ErrValidation("cannot use --scope together with --domain/--recommend")
-		}
-
 		var candidateScopes []string
 		if len(selectedDomains) > 0 {
-			candidateScopes = collectScopesForDomains(selectedDomains, "user")
+			candidateScopes = collectScopesForDomains(selectedDomains, "user", config.Brand)
 		} else {
 			// --recommend without --domain: all domains
-			candidateScopes = collectScopesForDomains(sortedKnownDomains(), "user")
+			candidateScopes = collectScopesForDomains(sortedKnownDomains(config.Brand), "user", config.Brand)
 		}
 
 		// Filter to auto-approve scopes if --recommend or interactive "common"
@@ -206,11 +225,35 @@ func authLoginRun(opts *LoginOptions) error {
 			candidateScopes = registry.FilterAutoApproveScopes(candidateScopes)
 		}
 
-		if len(candidateScopes) == 0 {
+		if len(candidateScopes) == 0 && opts.Scope == "" {
 			return output.ErrValidation("no matching scopes found, check domain/scope options")
 		}
 
-		finalScope = strings.Join(candidateScopes, " ")
+		// Merge --scope additively with the resolved domain scopes.
+		merged := make(map[string]bool, len(candidateScopes)+len(strings.Fields(finalScope)))
+		for _, s := range candidateScopes {
+			merged[s] = true
+		}
+		for _, s := range strings.Fields(finalScope) {
+			merged[s] = true
+		}
+		finalScope = joinSortedScopeSet(merged)
+	}
+
+	// Apply --exclude on top of the resolved scope set. We honour exclude
+	// regardless of whether scopes came from --scope, --domain, --recommend,
+	// or any combination thereof.
+	if len(opts.Exclude) > 0 {
+		excluded, unknown := applyExcludeScopes(finalScope, opts.Exclude)
+		if len(unknown) > 0 {
+			return output.ErrValidation(
+				"these --exclude scopes are not present in the requested set: %s",
+				strings.Join(unknown, ", "))
+		}
+		finalScope = excluded
+		if strings.TrimSpace(finalScope) == "" {
+			return output.ErrValidation("no scopes left after applying --exclude; nothing to authorize")
+		}
 	}
 
 	// Step 1: Request device authorization
@@ -232,7 +275,7 @@ func authLoginRun(opts *LoginOptions) error {
 			"verification_url": authResp.VerificationUriComplete,
 			"device_code":      authResp.DeviceCode,
 			"expires_in":       authResp.ExpiresIn,
-			"hint":             fmt.Sprintf("Show verification_url to user, then immediately execute: lark-cli auth login --device-code %s (blocks until authorized or timeout). Do not instruct the user to run this command themselves.", authResp.DeviceCode),
+			"hint":             fmt.Sprintf("Show verification_url to the user exactly as returned by the CLI and treat it as an opaque string. Do not URL-encode or decode it, do not normalize or rewrite it, do not add %%20, spaces, or punctuation, and do not wrap it as Markdown link text; prefer a fenced code block containing only the raw URL. For agent harnesses that only deliver final turn messages, make the URL the final message of the turn and return control to the user; do not block on --device-code in the same turn. After the user confirms authorization in a later step, run: lark-cli auth login --device-code %s", authResp.DeviceCode),
 		}
 		encoder := json.NewEncoder(f.IOStreams.Out)
 		encoder.SetEscapeHTML(false)
@@ -453,7 +496,7 @@ func findProfileByName(multi *core.MultiAppConfig, profileName string) *core.App
 // shortcut scopes for the given domain names.
 // Domains with auth_domain children are automatically expanded to include
 // their children's scopes.
-func collectScopesForDomains(domains []string, identity string) []string {
+func collectScopesForDomains(domains []string, identity string, brand core.LarkBrand) []string {
 	scopeSet := make(map[string]bool)
 
 	// 1. API scopes from from_meta projects
@@ -472,8 +515,11 @@ func collectScopesForDomains(domains []string, identity string) []string {
 
 	// 3. Shortcut scopes matching by Service (only include shortcuts supporting the identity)
 	for _, sc := range shortcuts.AllShortcuts() {
+		if !shortcuts.IsShortcutServiceAvailable(sc.Service, brand) {
+			continue
+		}
 		if domainSet[sc.Service] && shortcutSupportsIdentity(sc, identity) {
-			for _, s := range sc.ScopesForIdentity(identity) {
+			for _, s := range sc.DeclaredScopesForIdentity(identity) {
 				scopeSet[s] = true
 			}
 		}
@@ -491,7 +537,7 @@ func collectScopesForDomains(domains []string, identity string) []string {
 // allKnownDomains returns all valid auth domain names (from_meta projects +
 // shortcut services), excluding domains that have auth_domain set (they are
 // folded into their parent domain).
-func allKnownDomains() map[string]bool {
+func allKnownDomains(brand core.LarkBrand) map[string]bool {
 	domains := make(map[string]bool)
 	for _, p := range registry.ListFromMetaProjects() {
 		if !registry.HasAuthDomain(p) {
@@ -499,6 +545,9 @@ func allKnownDomains() map[string]bool {
 		}
 	}
 	for _, sc := range shortcuts.AllShortcuts() {
+		if !shortcuts.IsShortcutServiceAvailable(sc.Service, brand) {
+			continue
+		}
 		if !registry.HasAuthDomain(sc.Service) {
 			domains[sc.Service] = true
 		}
@@ -507,8 +556,8 @@ func allKnownDomains() map[string]bool {
 }
 
 // sortedKnownDomains returns all valid domain names sorted alphabetically.
-func sortedKnownDomains() []string {
-	m := allKnownDomains()
+func sortedKnownDomains(brand core.LarkBrand) []string {
+	m := allKnownDomains(brand)
 	domains := make([]string, 0, len(m))
 	for d := range m {
 		domains = append(domains, d)
@@ -532,6 +581,40 @@ func shortcutSupportsIdentity(sc common.Shortcut, identity string) bool {
 	return false
 }
 
+// normalizeScopeInput accepts a user-supplied --scope value that may use
+// commas, spaces, tabs, or newlines (or any mix) as separators and returns the
+// canonical OAuth 2.0 wire form: a single space-joined string with empties
+// trimmed and duplicates removed (first occurrence wins; order preserved).
+//
+// Examples:
+//
+//	"vc:note:read,vc:meeting.meetingevent:read" -> "vc:note:read vc:meeting.meetingevent:read"
+//	"a, b ,  c"                                 -> "a b c"
+//	"a b a"                                     -> "a b"
+//	""                                          -> ""
+func normalizeScopeInput(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	// Treat both commas and any whitespace as separators.
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	if len(fields) == 0 {
+		return ""
+	}
+	seen := make(map[string]struct{}, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if _, ok := seen[f]; ok {
+			continue
+		}
+		seen[f] = struct{}{}
+		out = append(out, f)
+	}
+	return strings.Join(out, " ")
+}
+
 // suggestDomain finds the best "did you mean" match for an unknown domain.
 func suggestDomain(input string, known map[string]bool) string {
 	// Check common cases: prefix match or input is a substring
@@ -541,4 +624,59 @@ func suggestDomain(input string, known map[string]bool) string {
 		}
 	}
 	return ""
+}
+
+// joinSortedScopeSet returns a deterministic, space-separated scope string
+// from a set, sorted alphabetically. Empty/blank scopes are dropped.
+func joinSortedScopeSet(set map[string]bool) string {
+	out := make([]string, 0, len(set))
+	for s := range set {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return strings.Join(out, " ")
+}
+
+// applyExcludeScopes removes the provided exclude entries from the requested
+// scope string. Each --exclude flag value may itself contain comma- or
+// whitespace-separated scopes. Returns the filtered scope string and any
+// exclude entries that were not present in the requested set (callers can
+// surface those as a validation error to catch typos like
+// `--exclude drive:file:downlod`).
+func applyExcludeScopes(requested string, excludes []string) (string, []string) {
+	requestedSet := make(map[string]bool)
+	for _, s := range strings.Fields(requested) {
+		requestedSet[s] = true
+	}
+
+	excludeSet := make(map[string]bool)
+	for _, raw := range excludes {
+		// --exclude already splits on commas (StringSliceVar), but also
+		// tolerate whitespace-separated entries inside a single value.
+		for _, s := range strings.Fields(strings.ReplaceAll(raw, ",", " ")) {
+			excludeSet[s] = true
+		}
+	}
+
+	var unknown []string
+	for s := range excludeSet {
+		if !requestedSet[s] {
+			unknown = append(unknown, s)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return requested, unknown
+	}
+
+	kept := make(map[string]bool, len(requestedSet))
+	for s := range requestedSet {
+		if !excludeSet[s] {
+			kept[s] = true
+		}
+	}
+	return joinSortedScopeSet(kept), nil
 }
